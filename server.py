@@ -1,132 +1,394 @@
 #!/usr/bin/env python3
-"""Tailscale-reachable toast notification server for macOS.
+"""Central notification backend for many Mac clients.
 
-POST /notify  {"title": "...", "message": "...", "duration_ms": 6000}
-GET  /health
+Clients connect over a WebSocket (``/ws?client=<id>``) and render toasts
+locally (see ``client.py``). Any client or process can push a notification to
+any client by POSTing to ``/notify`` with a ``target``; the backend assigns a
+globally-unique id and delivers it over the target's live socket, or queues it
+for delivery when the target reconnects.
+
+  POST /notify        {"target": "...", "title": "...", "message": "...", ...}
+  POST /notify/clear  {"target": "...", "id": "..."} | {"target": "...", "all": true}
+  GET  /clients       connected clients and queued counts
+  WS   /ws?client=ID  client connection (receives notify/clear messages)
+  GET  /health
+  + screen-lock coordination endpoints (POST /lock/acquire, ...)
 """
 
+import asyncio
 import os
-import queue
 import socket
-import threading
-import tkinter as tk
+import time
+import uuid
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, Field
 
 
 HOST = os.environ.get("NOTIFY_HOST", "0.0.0.0")
-PORT = int(os.environ.get("NOTIFY_PORT", "8765"))
+PORT = int(os.environ.get("NOTIFY_PORT", "8766"))
 AUTH_TOKEN = os.environ.get("NOTIFY_TOKEN") or None
 
-TOAST_DURATION_MS = 6000
-TOAST_WIDTH = 360
-TOAST_PADDING = 14
-TOAST_MARGIN = 18
-TOAST_GAP = 8
+# Offline delivery: per-client queue bounds.
+PENDING_TTL_S = float(os.environ.get("NOTIFY_QUEUE_TTL_S", "3600"))
+PENDING_MAXLEN = int(os.environ.get("NOTIFY_QUEUE_MAX", "100"))
 
-BG = "#1e1e2e"
-BORDER = "#45475a"
-TITLE_FG = "#f5e0dc"
-MSG_FG = "#cdd6f4"
+LOCK_DEFAULT_TTL_MS = 30000
+LOCK_DEFAULT_WAIT_MS = 60000
+LOCK_WATCHDOG_INTERVAL_S = 0.25
+NOTIFY_ON_LOCK = os.environ.get("NOTIFY_ON_LOCK", "1").lower() not in ("0", "false", "no")
 
-
-notification_queue: "queue.Queue[dict]" = queue.Queue()
+# Reserved target meaning "every connected client".
+BROADCAST = "*"
 
 
-class Notification(BaseModel):
+class NotifyRequest(BaseModel):
+    target: str = Field(..., min_length=1, max_length=200)
     title: str = Field(..., min_length=1, max_length=200)
     message: str = Field("", max_length=2000)
     duration_ms: Optional[int] = Field(None, ge=500, le=60000)
+    # When true the toast never auto-expires; it stays until cleared or clicked.
+    persistent: bool = False
+    # Optional caller-supplied id. Reusing an id replaces the toast in place on
+    # the client. If omitted, a globally-unique id is generated and returned.
+    id: Optional[str] = Field(None, min_length=1, max_length=200)
 
 
-app = FastAPI()
+class ClearRequest(BaseModel):
+    target: str = Field(..., min_length=1, max_length=200)
+    id: Optional[str] = Field(None, min_length=1, max_length=200)
+    all: bool = False
 
 
-@app.post("/notify")
-def notify(n: Notification, x_auth_token: Optional[str] = Header(default=None)):
+class AcquireRequest(BaseModel):
+    client: str = Field(..., min_length=1, max_length=200)
+    ttl_ms: int = Field(LOCK_DEFAULT_TTL_MS, ge=500, le=3_600_000)
+    wait_timeout_ms: int = Field(LOCK_DEFAULT_WAIT_MS, ge=0, le=3_600_000)
+
+
+class TokenRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+
+
+class RenewRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+    ttl_ms: int = Field(LOCK_DEFAULT_TTL_MS, ge=500, le=3_600_000)
+
+
+class Hub:
+    """Routes notifications to connected clients; queues for offline ones.
+
+    A client may have more than one live socket (e.g. it reconnected before the
+    old socket dropped); messages go to all of them. When a client has no live
+    socket, deliveries are buffered in a bounded, TTL'd per-client queue and
+    flushed on the next connect.
+    """
+
+    def __init__(self) -> None:
+        self._conns: dict[str, set[WebSocket]] = {}
+        self._pending: dict[str, "deque[tuple[float, dict]]"] = {}
+        self._lock = asyncio.Lock()
+
+    async def register(self, client: str, ws: WebSocket) -> None:
+        async with self._lock:
+            self._conns.setdefault(client, set()).add(ws)
+            pending = self._pending.pop(client, None)
+        if pending:
+            now = time.time()
+            for expires_at, msg in pending:
+                if expires_at >= now:
+                    await self._safe_send(ws, msg)
+
+    async def unregister(self, client: str, ws: WebSocket) -> None:
+        async with self._lock:
+            socks = self._conns.get(client)
+            if socks is not None:
+                socks.discard(ws)
+                if not socks:
+                    self._conns.pop(client, None)
+
+    async def deliver(self, target: str, msg: dict, queue_offline: bool = True) -> dict:
+        async with self._lock:
+            socks = list(self._conns.get(target, ()))
+        if socks:
+            for ws in socks:
+                await self._safe_send(ws, msg)
+            return {"delivered": True, "queued": False}
+        if queue_offline:
+            async with self._lock:
+                dq = self._pending.setdefault(target, deque(maxlen=PENDING_MAXLEN))
+                dq.append((time.time() + PENDING_TTL_S, msg))
+            return {"delivered": False, "queued": True}
+        return {"delivered": False, "queued": False}
+
+    async def broadcast(self, msg: dict) -> dict:
+        async with self._lock:
+            socks = [ws for socket_set in self._conns.values() for ws in socket_set]
+        for ws in socks:
+            await self._safe_send(ws, msg)
+        return {"delivered": bool(socks), "queued": False}
+
+    async def clients(self) -> dict:
+        async with self._lock:
+            return {
+                "connected": {c: len(s) for c, s in self._conns.items()},
+                "pending": {c: len(q) for c, q in self._pending.items()},
+            }
+
+    @staticmethod
+    async def _safe_send(ws: WebSocket, msg: dict) -> None:
+        try:
+            await ws.send_json(msg)
+        except Exception:
+            pass  # socket is dead; unregister happens on its own receive loop
+
+
+hub = Hub()
+
+
+def _lock_toast(emoji_title: str, message: str) -> None:
+    """Broadcast a screen-lock status toast to every connected client."""
+    if NOTIFY_ON_LOCK:
+        msg = {
+            "type": "notify",
+            "id": uuid.uuid4().hex,
+            "title": emoji_title,
+            "message": message,
+            "duration_ms": 3000,
+            "persistent": False,
+        }
+        asyncio.create_task(hub.broadcast(msg))
+
+
+@dataclass
+class Lease:
+    """An exclusive hold on the screen, owned by one client until expiry."""
+
+    client: str
+    token: str
+    acquired_at: float
+    expires_at: float
+
+
+class ScreenLock:
+    """A single global, lease-based mutex over the screen.
+
+    The lock is *advisory*: it serializes cooperating clients but performs no
+    screen actions itself. Each grant carries a fencing ``token`` required to
+    release or renew, so a stale holder (whose lease already expired and was
+    reassigned) can never release or extend someone else's lock. A watchdog
+    expires abandoned leases so a crashed holder can't deadlock everyone.
+    """
+
+    def __init__(self) -> None:
+        self._holder: Optional[Lease] = None
+        self._waiters: "deque[tuple[str, float, asyncio.Future]]" = deque()
+        self._mutex = asyncio.Lock()
+
+    def _grant_locked(self, client: str, ttl_ms: float) -> Lease:
+        now = time.time()
+        lease = Lease(client, uuid.uuid4().hex, now, now + ttl_ms / 1000.0)
+        self._holder = lease
+        _lock_toast("🔒 Screen locked", f"{client} is controlling the screen")
+        return lease
+
+    def _reap_locked(self) -> None:
+        """Drop an expired holder and hand off to the next waiter."""
+        if self._holder is not None and time.time() >= self._holder.expires_at:
+            _lock_toast("🔓 Screen released", f"{self._holder.client} lease expired")
+            self._holder = None
+            self._promote_locked()
+
+    def _promote_locked(self) -> None:
+        """Give the lock to the next live waiter, or leave it free."""
+        while self._waiters:
+            client, ttl_ms, fut = self._waiters.popleft()
+            if fut.cancelled() or fut.done():
+                continue  # waiter gave up (timed out); skip it
+            fut.set_result(self._grant_locked(client, ttl_ms))
+            return
+        self._holder = None
+
+    async def acquire(self, client: str, ttl_ms: float, wait_timeout_ms: float) -> Lease:
+        loop = asyncio.get_running_loop()
+        async with self._mutex:
+            self._reap_locked()
+            if self._holder is None:
+                return self._grant_locked(client, ttl_ms)
+            fut: asyncio.Future = loop.create_future()
+            entry = (client, ttl_ms, fut)
+            self._waiters.append(entry)
+
+        try:
+            return await asyncio.wait_for(fut, wait_timeout_ms / 1000.0)
+        except asyncio.TimeoutError:
+            async with self._mutex:
+                try:
+                    self._waiters.remove(entry)
+                except ValueError:
+                    # Promoted at the moment of timeout: honor the grant.
+                    if fut.done() and not fut.cancelled():
+                        return fut.result()
+            raise HTTPException(status_code=408, detail="timeout waiting for lock")
+
+    async def release(self, token: str) -> bool:
+        async with self._mutex:
+            if self._holder is None or self._holder.token != token:
+                return False
+            _lock_toast("🔓 Screen released", f"{self._holder.client} released the screen")
+            self._holder = None
+            self._promote_locked()
+            return True
+
+    async def renew(self, token: str, ttl_ms: float) -> Optional[Lease]:
+        async with self._mutex:
+            self._reap_locked()
+            if self._holder is None or self._holder.token != token:
+                return None
+            self._holder.expires_at = time.time() + ttl_ms / 1000.0
+            return self._holder
+
+    async def status(self) -> dict:
+        async with self._mutex:
+            self._reap_locked()
+            h = self._holder
+            return {
+                "locked": h is not None,
+                "holder": h.client if h else None,
+                "acquired_at": h.acquired_at if h else None,
+                "expires_at": h.expires_at if h else None,
+                "queue_depth": len(self._waiters),
+                "waiters": [c for c, _, _ in self._waiters],
+            }
+
+    async def watchdog(self) -> None:
+        while True:
+            await asyncio.sleep(LOCK_WATCHDOG_INTERVAL_S)
+            async with self._mutex:
+                self._reap_locked()
+
+
+lock = ScreenLock()
+
+
+def check_auth(x_auth_token: Optional[str] = Header(default=None)) -> None:
     if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
         raise HTTPException(status_code=401, detail="invalid token")
-    notification_queue.put(n.model_dump())
-    return {"status": "queued"}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(lock.watchdog())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    client = ws.query_params.get("client")
+    token = ws.query_params.get("token")
+    if not client or (AUTH_TOKEN and token != AUTH_TOKEN):
+        await ws.close(code=1008)  # policy violation
+        return
+    await ws.accept()
+    await hub.register(client, ws)
+    try:
+        while True:
+            await ws.receive_text()  # inbound is ignored; keeps the socket open
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await hub.unregister(client, ws)
+
+
+@app.post("/notify", dependencies=[Depends(check_auth)])
+async def notify(n: NotifyRequest):
+    nid = n.id or uuid.uuid4().hex
+    msg = {
+        "type": "notify",
+        "id": nid,
+        "title": n.title,
+        "message": n.message,
+        "duration_ms": n.duration_ms,
+        "persistent": n.persistent,
+    }
+    if n.target == BROADCAST:
+        result = await hub.broadcast(msg)
+        result["broadcast"] = True
+    else:
+        result = await hub.deliver(n.target, msg)
+    return {"id": nid, "target": n.target, **result}
+
+
+@app.post("/notify/clear", dependencies=[Depends(check_auth)])
+async def notify_clear(req: ClearRequest):
+    if not req.all and not req.id:
+        raise HTTPException(status_code=422, detail="provide 'id' or 'all'")
+    msg = {"type": "clear", "id": req.id, "all": req.all}
+    if req.target == BROADCAST:
+        await hub.broadcast(msg)
+        return {"status": "clearing", "broadcast": True}
+    # Clearing only matters for a live client; don't queue for offline ones.
+    result = await hub.deliver(req.target, msg, queue_offline=False)
+    return {"status": "clearing", **result}
+
+
+@app.get("/clients", dependencies=[Depends(check_auth)])
+async def clients():
+    return await hub.clients()
+
+
+@app.post("/lock/acquire", dependencies=[Depends(check_auth)])
+async def lock_acquire(req: AcquireRequest):
+    lease = await lock.acquire(req.client, req.ttl_ms, req.wait_timeout_ms)
+    return {
+        "token": lease.token,
+        "holder": lease.client,
+        "acquired_at": lease.acquired_at,
+        "expires_at": lease.expires_at,
+    }
+
+
+@app.post("/lock/release", dependencies=[Depends(check_auth)])
+async def lock_release(req: TokenRequest):
+    if not await lock.release(req.token):
+        raise HTTPException(status_code=409, detail="not the lock holder")
+    return {"released": True}
+
+
+@app.post("/lock/renew", dependencies=[Depends(check_auth)])
+async def lock_renew(req: RenewRequest):
+    lease = await lock.renew(req.token, req.ttl_ms)
+    if lease is None:
+        raise HTTPException(status_code=409, detail="not the lock holder")
+    return {"expires_at": lease.expires_at}
+
+
+@app.get("/lock/status", dependencies=[Depends(check_auth)])
+async def lock_status():
+    return await lock.status()
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-class ToastManager:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.active: list[tk.Toplevel] = []
-
-    def show(self, title: str, message: str, duration_ms: int):
-        win = tk.Toplevel(self.root)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        try:
-            win.attributes("-alpha", 0.96)
-        except tk.TclError:
-            pass
-
-        frame = tk.Frame(
-            win, bg=BG, padx=TOAST_PADDING, pady=TOAST_PADDING,
-            highlightbackground=BORDER, highlightthickness=1,
-        )
-        frame.pack(fill="both", expand=True)
-
-        wrap_px = TOAST_WIDTH - 2 * TOAST_PADDING
-
-        title_lbl = tk.Label(
-            frame, text=title, bg=BG, fg=TITLE_FG,
-            font=("Helvetica", 13, "bold"),
-            wraplength=wrap_px, justify="left", anchor="w",
-        )
-        title_lbl.pack(fill="x")
-
-        widgets = [win, frame, title_lbl]
-
-        if message:
-            msg_lbl = tk.Label(
-                frame, text=message, bg=BG, fg=MSG_FG,
-                font=("Helvetica", 11),
-                wraplength=wrap_px, justify="left", anchor="w",
-            )
-            msg_lbl.pack(fill="x", pady=(4, 0))
-            widgets.append(msg_lbl)
-
-        self.active.append(win)
-        self._reposition()
-
-        def close(_evt=None):
-            if win in self.active:
-                self.active.remove(win)
-            try:
-                win.destroy()
-            except tk.TclError:
-                pass
-            self._reposition()
-
-        for w in widgets:
-            w.bind("<Button-1>", close)
-
-        win.after(duration_ms, close)
-
-    def _reposition(self):
-        screen_w = self.root.winfo_screenwidth()
-        y = TOAST_MARGIN
-        for win in list(self.active):
-            try:
-                win.update_idletasks()
-                h = win.winfo_reqheight()
-                x = screen_w - TOAST_WIDTH - TOAST_MARGIN
-                win.geometry(f"{TOAST_WIDTH}x{h}+{x}+{y}")
-                y += h + TOAST_GAP
-            except tk.TclError:
-                pass
 
 
 def _local_ips() -> list[str]:
@@ -142,38 +404,14 @@ def _local_ips() -> list[str]:
     return ips
 
 
-def run_server():
-    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="info")
-    server = uvicorn.Server(config)
-    server.install_signal_handlers = lambda: None
-    server.run()
-
-
 def main():
-    print(f"Notification server listening on http://{HOST}:{PORT}")
+    print(f"Notification backend listening on http://{HOST}:{PORT}")
     for ip in _local_ips():
-        print(f"  reachable at http://{ip}:{PORT}/notify")
+        print(f"  clients connect to ws://{ip}:{PORT}/ws?client=<id>")
     if AUTH_TOKEN:
-        print("  auth: X-Auth-Token header required")
-
-    threading.Thread(target=run_server, daemon=True).start()
-
-    root = tk.Tk()
-    root.withdraw()
-    manager = ToastManager(root)
-
-    def poll():
-        try:
-            while True:
-                n = notification_queue.get_nowait()
-                duration = n.get("duration_ms") or TOAST_DURATION_MS
-                manager.show(n["title"], n.get("message", ""), duration)
-        except queue.Empty:
-            pass
-        root.after(100, poll)
-
-    root.after(100, poll)
-    root.mainloop()
+        print("  auth: X-Auth-Token header (HTTP) / ?token= (WebSocket) required")
+    print(f"  lock toasts: {'on' if NOTIFY_ON_LOCK else 'off'} (NOTIFY_ON_LOCK)")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 
 if __name__ == "__main__":
