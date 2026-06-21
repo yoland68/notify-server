@@ -167,12 +167,16 @@ deadlock everyone. When `NOTIFY_ON_LOCK` is on, holding the lock shows a "🔒 S
 on `NOTIFY_LOCK_TARGET` (default `macmini`) for as long as it's held; the toast (stable id
 `screen-lock`) is repinned for the new holder on hand-off and cleared on release or lease expiry.
 
-The toast is deliberately **not** a `persistent` one. It carries `duration_ms` equal to the lease
-TTL and is refreshed on every `renew`, so it stays visible while the lock is genuinely held but
-**auto-expires with the lease** — a lost `clear` (server restart, or the target offline at the
-moment of release) can never strand a 🔒 on screen forever. As a second guard, a client is
-reconciled on every (re)connect: it's re-shown the toast if a lock it targets is live, or sent a
-`clear` otherwise, so any orphaned toast is wiped the moment that client reconnects.
+The toast is **persistent** — it stays up for the entire hold and is cleared the moment the lock
+is released, faithfully mirroring lock state. It's safe to be persistent because the **server**
+owns clearing it, three ways, so a lost `clear` can never strand a 🔒 on screen forever:
+
+1. on **release**;
+2. on **watchdog lease-expiry** — a holder that dies without releasing still gets its toast cleared
+   within one TTL;
+3. on **reconnect** — every client is reconciled when it (re)connects: re-shown the toast if a lock
+   it targets is live, or sent a `clear` otherwise, wiping any orphan (e.g. one left by a server
+   restart) the moment that client reconnects.
 
 > Note: this is a single *global* lock across all clients (one shared "screen" abstraction),
 > not one lock per machine. Revisit if you need per-client locks.

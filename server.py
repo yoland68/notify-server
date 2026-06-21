@@ -183,23 +183,22 @@ def _route_lock_notification(msg: dict) -> None:
         asyncio.create_task(hub.deliver(LOCK_NOTIFY_TARGET, msg))
 
 
-def _lock_held_msg(client: str, duration_ms: float) -> dict:
-    """A 'screen locked' toast that **auto-expires with the lease**.
+def _lock_held_msg(client: str) -> dict:
+    """A **persistent** 'screen locked' toast — stays up for the whole hold.
 
-    Deliberately NOT `persistent`: a truly persistent toast outlives any lost
-    `clear` (server restart, or the target offline at release) and strands a 🔒
-    on screen forever — which looks like the lock is stuck. Tying its lifetime to
-    the lease TTL bounds that: the toast can never outlive the lock by more than
-    one TTL, and while the lock is genuinely held it's refreshed on every renew
-    (reusing the id resets the client-side timer), so it stays up the whole time.
+    Safe to be persistent because the *server* owns clearing it, three ways: on
+    release, on watchdog lease-expiry (a holder that dies without releasing still
+    gets its toast cleared within one TTL), and via `_reconcile_lock_toast` on the
+    target's next (re)connect. So a lost `clear` can't strand a 🔒 forever — unlike
+    the old per-script toast, which had only a best-effort release-clear.
     """
     return {
         "type": "notify",
         "id": LOCK_NOTIFY_ID,
         "title": "🔒 Screen locked",
         "message": f"{client} is controlling the screen",
-        "duration_ms": max(1, int(duration_ms)),
-        "persistent": False,
+        "duration_ms": None,
+        "persistent": True,
     }
 
 
@@ -207,8 +206,8 @@ def _lock_clear_msg() -> dict:
     return {"type": "clear", "id": LOCK_NOTIFY_ID, "all": False}
 
 
-def _lock_notify_held(client: str, ttl_ms: float) -> None:
-    _route_lock_notification(_lock_held_msg(client, ttl_ms))
+def _lock_notify_held(client: str) -> None:
+    _route_lock_notification(_lock_held_msg(client))
 
 
 def _lock_notify_free() -> None:
@@ -244,7 +243,7 @@ class ScreenLock:
         now = time.time()
         lease = Lease(client, uuid.uuid4().hex, now, now + ttl_ms / 1000.0)
         self._holder = lease
-        _lock_notify_held(client, ttl_ms)
+        _lock_notify_held(client)
         return lease
 
     def _reap_locked(self) -> None:
@@ -304,7 +303,7 @@ class ScreenLock:
             if self._holder is None or self._holder.token != token:
                 return None
             self._holder.expires_at = time.time() + ttl_ms / 1000.0
-            _lock_notify_held(self._holder.client, ttl_ms)  # refresh the toast timer
+            _lock_notify_held(self._holder.client)  # re-assert the toast (holder unchanged)
             return self._holder
 
     async def status(self) -> dict:
@@ -344,8 +343,7 @@ async def _reconcile_lock_toast(client: str, ws: WebSocket) -> None:
     st = await lock.status()
     is_target = LOCK_NOTIFY_TARGET in (BROADCAST, client)
     if st["locked"] and is_target:
-        remaining_ms = (st["expires_at"] - time.time()) * 1000.0
-        await Hub._safe_send(ws, _lock_held_msg(st["holder"], remaining_ms))
+        await Hub._safe_send(ws, _lock_held_msg(st["holder"]))
     else:
         await Hub._safe_send(ws, _lock_clear_msg())
 
