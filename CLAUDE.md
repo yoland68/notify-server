@@ -57,14 +57,16 @@ Runs entirely on uvicorn's asyncio loop (no threads, no Tkinter). Started with `
 
 - `Hub` — the routing core. Holds `client id → set[WebSocket]` (`_conns`) and a bounded, TTL'd
   per-client offline queue (`_pending`), guarded by an `asyncio.Lock`. `deliver()` sends to all
-  of a target's live sockets, else enqueues; `register()` flushes the queue on (re)connect;
+  of a target's live sockets; if the target is offline it drops the message unless
+  `queue_offline=True`, in which case it enqueues. `register()` flushes the queue on (re)connect;
   `broadcast()` hits every connected socket (never queues); `_safe_send` swallows dead-socket errors.
 - `WS /ws?client=<id>[&token=]` — registers a connection (auth + client id from query params),
   then ignores inbound frames (push-only) until disconnect, when it unregisters.
 - `NotifyRequest` / `POST /notify` — validated payload (`target`, `title`, `message`,
-  `duration_ms`, `persistent`, `id`). Assigns a globally-unique `id` if none supplied (reusing an
-  id replaces the toast in place on the client), builds a `{"type":"notify", ...}` message, and
-  routes it. `target: "*"` broadcasts.
+  `duration_ms`, `persistent`, `id`, `queue_offline`). Assigns a globally-unique `id` if none
+  supplied (reusing an id replaces the toast in place on the client), builds a
+  `{"type":"notify", ...}` message, and routes it. An offline target is dropped unless
+  `queue_offline` is true. `target: "*"` broadcasts.
 - `ClearRequest` / `POST /notify/clear` — sends `{"type":"clear", "id"|"all"}` to the target
   (live only — offline clients have nothing to clear). `422` if neither `id` nor `all`.
 - `GET /clients` — connected clients (socket counts) and per-client pending counts.
@@ -72,9 +74,13 @@ Runs entirely on uvicorn's asyncio loop (no threads, no Tkinter). Started with `
   `acquired_at`, `expires_at`) + a FIFO `deque` of waiters parked on `asyncio.Future`s under an
   `asyncio.Lock`. `watchdog()` (started via `lifespan`) expires abandoned leases and promotes the
   next waiter, preventing deadlock if a holder crashes. Acquire/release/promote are race-safe (a
-  timed-out waiter is skipped on promotion). `_lock_toast` broadcasts a lock status toast to all
-  clients when `NOTIFY_ON_LOCK` is on. The lock is **advisory** and **global** (one shared screen
-  abstraction across all clients) — the backend never surfaces windows or clicks.
+  timed-out waiter is skipped on promotion). Notifications track holder state via two helpers:
+  `_grant_locked` calls `_lock_notify_held` (a **persistent** toast, stable id `screen-lock`) and
+  the drain tail of `_promote_locked` calls `_lock_notify_free` (clear). So holding the lock pins a
+  "🔒 Screen locked" toast on `NOTIFY_LOCK_TARGET` (default `mainbook`, `*` for all), repins it on
+  hand-off, and clears it on release/expiry, when `NOTIFY_ON_LOCK` is on. The lock is **advisory**
+  and **global** (one shared screen abstraction across all clients) — the backend never surfaces
+  windows or clicks.
 - `check_auth` — dependency enforcing `X-Auth-Token` on `/notify`, `/notify/clear`, `/clients`,
   and all `/lock/*` (not `/health`). WS auth uses `?token=`.
 - Lock endpoints: `POST /lock/acquire` (blocks, FIFO, `408` on `wait_timeout_ms`; returns a
@@ -95,7 +101,7 @@ those queues every 100ms.
 ### Environment variables
 
 Backend: `NOTIFY_HOST` (`0.0.0.0`), `NOTIFY_PORT` (`8766`), `NOTIFY_TOKEN` (auth; `X-Auth-Token`
-header for HTTP and `?token=` for WS), `NOTIFY_ON_LOCK` (`1`; broadcast lock toasts),
+header for HTTP and `?token=` for WS), `NOTIFY_ON_LOCK` (`1`; persistent lock toasts), `NOTIFY_LOCK_TARGET` (`mainbook`; lock-toast recipient, `*` = all),
 `NOTIFY_QUEUE_TTL_S` (`3600`), `NOTIFY_QUEUE_MAX` (`100`).
 
 Client: `NOTIFY_BACKEND` (`ws://localhost:8766`), `NOTIFY_CLIENT` (default: hostname),

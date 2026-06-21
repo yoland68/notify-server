@@ -50,6 +50,14 @@ LOCK_DEFAULT_WAIT_MS = 60000
 LOCK_WATCHDOG_INTERVAL_S = 0.25
 NOTIFY_ON_LOCK = os.environ.get("NOTIFY_ON_LOCK", "1").lower() not in ("0", "false", "no")
 
+# Where the persistent "screen locked" toast goes — the client whose screen the
+# automation actually drives (and where you watch it), i.e. the machine running
+# the lock holder. Set to "*" to pin it on every connected client instead.
+LOCK_NOTIFY_TARGET = os.environ.get("NOTIFY_LOCK_TARGET", "mainbook")
+# Stable id so acquire pins one toast and release clears that exact toast; reusing
+# the id also lets a hand-off replace the holder text in place.
+LOCK_NOTIFY_ID = "screen-lock"
+
 # Reserved target meaning "every connected client".
 BROADCAST = "*"
 
@@ -64,6 +72,10 @@ class NotifyRequest(BaseModel):
     # Optional caller-supplied id. Reusing an id replaces the toast in place on
     # the client. If omitted, a globally-unique id is generated and returned.
     id: Optional[str] = Field(None, min_length=1, max_length=200)
+    # By default a notification to an offline client is dropped. Set this to
+    # require delivery: the message is queued and delivered when the client
+    # (re)connects.
+    queue_offline: bool = False
 
 
 class ClearRequest(BaseModel):
@@ -119,7 +131,7 @@ class Hub:
                 if not socks:
                     self._conns.pop(client, None)
 
-    async def deliver(self, target: str, msg: dict, queue_offline: bool = True) -> dict:
+    async def deliver(self, target: str, msg: dict, queue_offline: bool = False) -> dict:
         async with self._lock:
             socks = list(self._conns.get(target, ()))
         if socks:
@@ -158,18 +170,35 @@ class Hub:
 hub = Hub()
 
 
-def _lock_toast(emoji_title: str, message: str) -> None:
-    """Broadcast a screen-lock status toast to every connected client."""
-    if NOTIFY_ON_LOCK:
-        msg = {
-            "type": "notify",
-            "id": uuid.uuid4().hex,
-            "title": emoji_title,
-            "message": message,
-            "duration_ms": 3000,
-            "persistent": False,
-        }
+def _route_lock_notification(msg: dict) -> None:
+    """Fire-and-forget a lock notify/clear to the configured target.
+
+    Best-effort: never queued for an offline client, so a dropped mac mini can't
+    receive a stale 'locked' toast minutes later with no matching clear.
+    """
+    if not NOTIFY_ON_LOCK:
+        return
+    if LOCK_NOTIFY_TARGET == BROADCAST:
         asyncio.create_task(hub.broadcast(msg))
+    else:
+        asyncio.create_task(hub.deliver(LOCK_NOTIFY_TARGET, msg))
+
+
+def _lock_notify_held(client: str) -> None:
+    """Pin a persistent 'screen locked' toast (replaces the prior holder's)."""
+    _route_lock_notification({
+        "type": "notify",
+        "id": LOCK_NOTIFY_ID,
+        "title": "🔒 Screen locked",
+        "message": f"{client} is controlling the screen",
+        "duration_ms": None,
+        "persistent": True,
+    })
+
+
+def _lock_notify_free() -> None:
+    """Clear the persistent lock toast when the screen is no longer held."""
+    _route_lock_notification({"type": "clear", "id": LOCK_NOTIFY_ID, "all": False})
 
 
 @dataclass
@@ -201,18 +230,21 @@ class ScreenLock:
         now = time.time()
         lease = Lease(client, uuid.uuid4().hex, now, now + ttl_ms / 1000.0)
         self._holder = lease
-        _lock_toast("🔒 Screen locked", f"{client} is controlling the screen")
+        _lock_notify_held(client)
         return lease
 
     def _reap_locked(self) -> None:
         """Drop an expired holder and hand off to the next waiter."""
         if self._holder is not None and time.time() >= self._holder.expires_at:
-            _lock_toast("🔓 Screen released", f"{self._holder.client} lease expired")
             self._holder = None
             self._promote_locked()
 
     def _promote_locked(self) -> None:
-        """Give the lock to the next live waiter, or leave it free."""
+        """Give the lock to the next live waiter, or leave it free.
+
+        Notifications follow the holder: a grant repins the persistent toast for
+        the new holder (`_grant_locked`); draining to no holder clears it.
+        """
         while self._waiters:
             client, ttl_ms, fut = self._waiters.popleft()
             if fut.cancelled() or fut.done():
@@ -220,6 +252,7 @@ class ScreenLock:
             fut.set_result(self._grant_locked(client, ttl_ms))
             return
         self._holder = None
+        _lock_notify_free()
 
     async def acquire(self, client: str, ttl_ms: float, wait_timeout_ms: float) -> Lease:
         loop = asyncio.get_running_loop()
@@ -247,7 +280,6 @@ class ScreenLock:
         async with self._mutex:
             if self._holder is None or self._holder.token != token:
                 return False
-            _lock_toast("🔓 Screen released", f"{self._holder.client} released the screen")
             self._holder = None
             self._promote_locked()
             return True
@@ -333,7 +365,7 @@ async def notify(n: NotifyRequest):
         result = await hub.broadcast(msg)
         result["broadcast"] = True
     else:
-        result = await hub.deliver(n.target, msg)
+        result = await hub.deliver(n.target, msg, queue_offline=n.queue_offline)
     return {"id": nid, "target": n.target, **result}
 
 
@@ -410,7 +442,11 @@ def main():
         print(f"  clients connect to ws://{ip}:{PORT}/ws?client=<id>")
     if AUTH_TOKEN:
         print("  auth: X-Auth-Token header (HTTP) / ?token= (WebSocket) required")
-    print(f"  lock toasts: {'on' if NOTIFY_ON_LOCK else 'off'} (NOTIFY_ON_LOCK)")
+    if NOTIFY_ON_LOCK:
+        dest = "all clients" if LOCK_NOTIFY_TARGET == BROADCAST else f"'{LOCK_NOTIFY_TARGET}'"
+        print(f"  lock toasts: on -> {dest} (persistent; NOTIFY_ON_LOCK/NOTIFY_LOCK_TARGET)")
+    else:
+        print("  lock toasts: off (NOTIFY_ON_LOCK=0)")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 

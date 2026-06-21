@@ -5,7 +5,8 @@ A central **notification backend** for many Mac clients, plus a **screen-lock co
 - **Backend** (`server.py`) — a router with no GUI. Clients connect over a WebSocket; any
   client or process pushes a notification to any client by POSTing to `/notify` with a
   `target`. The backend assigns a globally-unique id and delivers it over the target's live
-  socket, or **queues** it for delivery when the target reconnects.
+  socket. If the target is offline the message is **dropped by default**; pass
+  `queue_offline: true` to require delivery — it's buffered and flushed when the target reconnects.
 - **Client agent** (`client.py`) — runs on each Mac. Connects to the backend with a client id
   and renders received notifications as desktop toasts in the top-right corner. Reconnects
   automatically.
@@ -59,7 +60,8 @@ The backend host can also run its own client (the two are separate processes).
 | `NOTIFY_HOST` | `0.0.0.0` | Bind address |
 | `NOTIFY_PORT` | `8766` | Listen port |
 | `NOTIFY_TOKEN` | _(unset)_ | If set, HTTP requests need `X-Auth-Token: <value>` and WS connects need `?token=<value>` |
-| `NOTIFY_ON_LOCK` | `1` | Broadcast a toast to all clients when the screen lock is acquired/released. `0` to disable. |
+| `NOTIFY_ON_LOCK` | `1` | Pin a persistent "🔒 Screen locked" toast while the screen lock is held, cleared on release/expiry. `0` to disable. |
+| `NOTIFY_LOCK_TARGET` | `mainbook` | Client that receives the persistent lock toast — the machine whose screen the automation drives. `*` to pin it on every connected client. |
 | `NOTIFY_QUEUE_TTL_S` | `3600` | How long an offline client's queued messages live |
 | `NOTIFY_QUEUE_MAX` | `100` | Max queued messages per offline client (oldest dropped) |
 
@@ -88,6 +90,7 @@ supply) and returns it.
 | `duration_ms` | integer | no | 500–60000 | 6000 |
 | `persistent` | boolean | no | stays until cleared/clicked (ignores `duration_ms`) | `false` |
 | `id` | string | no | 1–200 chars; reuse to replace a toast in place | _(generated)_ |
+| `queue_offline` | boolean | no | if target offline: `true` queues until reconnect, `false` drops | `false` |
 
 **Response:**
 
@@ -95,8 +98,10 @@ supply) and returns it.
 {"id": "ab12…", "target": "macbook", "delivered": true, "queued": false}
 ```
 
-- `delivered` — sent to at least one live socket. `queued` — buffered because the target was offline.
-- Broadcast (`target: "*"`) responses include `"broadcast": true` and are never queued.
+- `delivered` — sent to at least one live socket. `queued` — buffered for an offline target.
+- By default an offline target is **dropped** (`delivered: false, queued: false`). Set
+  `queue_offline: true` to buffer it instead and deliver on reconnect.
+- Broadcast (`target: "*"`) responses include `"broadcast": true` and only reach connected clients.
 
 ### `POST /notify/clear`
 
@@ -158,7 +163,11 @@ others **block** on `acquire` (long-poll) and are granted the lock in **FIFO ord
 frees up. Every grant returns a fencing `token` required to `release` or `renew` — so a stale
 holder (whose lease already expired and was handed to someone else) can never release or extend
 someone else's lock. A watchdog auto-expires abandoned leases, so a crashed holder can't
-deadlock everyone. When `NOTIFY_ON_LOCK` is on, acquire/release broadcast a toast to all clients.
+deadlock everyone. When `NOTIFY_ON_LOCK` is on, holding the lock pins a **persistent** "🔒 Screen
+locked" toast on `NOTIFY_LOCK_TARGET` (default `mainbook` — the client whose screen the automation
+drives) for as long as it's held; the toast (stable id `screen-lock`) is repinned for the new
+holder on hand-off and cleared on release or lease expiry, so that machine always shows whether
+its screen is currently under automation.
 
 > Note: this is a single *global* lock across all clients (one shared "screen" abstraction),
 > not one lock per machine. Revisit if you need per-client locks.
@@ -212,8 +221,8 @@ All lock endpoints honor `X-Auth-Token` when `NOTIFY_TOKEN` is set.
 **Backend** (`server.py`) runs entirely on uvicorn's asyncio loop — no GUI:
 
 - A `Hub` holds `client id → set of live WebSockets` and a bounded, TTL'd per-client queue for
-  offline targets. `POST /notify` routes to the target's sockets or enqueues; `/ws` flushes the
-  queue on connect.
+  offline targets. `POST /notify` routes to the target's sockets; if the target is offline it
+  drops the message, or enqueues it when `queue_offline` is set. `/ws` flushes the queue on connect.
 - The screen lock is an async manager: current lease + a FIFO queue of waiters parked on
   `asyncio` futures, plus a watchdog task that expires abandoned leases and promotes the next
   waiter.
