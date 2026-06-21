@@ -54,6 +54,9 @@ class ToastManager:
 
     def show(self, title: str, message: str, duration_ms: int,
              toast_id: Optional[str] = None, persistent: bool = False):
+        # Remember who's in front; showing the window will briefly steal the
+        # foreground and we restore it at the end so the toast never takes over.
+        prev_app = _frontmost_app()
         # Reusing an id replaces the existing toast (update in place).
         if toast_id is not None and toast_id in self.by_id:
             self._destroy(self.by_id[toast_id])
@@ -111,6 +114,9 @@ class ToastManager:
 
         if not persistent:
             win.after(duration_ms, lambda wn=win: self._destroy(wn))
+
+        win.update_idletasks()
+        _restore_frontmost(prev_app)
 
     def _destroy(self, win: tk.Toplevel):
         if win in self.active:
@@ -176,12 +182,46 @@ async def ws_loop():
         await asyncio.sleep(RECONNECT_DELAY_S)
 
 
+def _make_accessory_app():
+    """Make this process a macOS *accessory* (agent) app: no Dock icon. Harmless
+    no-op if AppKit/pyobjc isn't available or we're not on macOS."""
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+    except Exception:
+        pass
+
+
+def _frontmost_app():
+    """The app currently in the foreground, so we can restore it after a toast."""
+    try:
+        from AppKit import NSWorkspace
+        return NSWorkspace.sharedWorkspace().frontmostApplication()
+    except Exception:
+        return None
+
+
+def _restore_frontmost(app):
+    """Re-activate `app`. Tk activates this process whenever it maps a window
+    (even an accessory, even a noActivates panel), so a toast briefly grabs the
+    foreground; restoring the prior app immediately is what stops it from taking
+    over the UI. No-op if AppKit is unavailable."""
+    if app is not None:
+        try:
+            app.activateWithOptions_(0)
+        except Exception:
+            pass
+
+
 def main():
     print(f"Notification client '{CLIENT_ID}' -> {BACKEND}")
     threading.Thread(target=lambda: asyncio.run(ws_loop()), daemon=True).start()
 
     root = tk.Tk()
     root.withdraw()
+    _make_accessory_app()  # after Tk creates NSApplication, before any toast
     manager = ToastManager(root)
 
     def poll():

@@ -2,3 +2,6 @@ fastapi>=0.110
 uvicorn>=0.27
 pydantic>=2.0
 websockets>=12.0
+# client.py only (macOS): make the renderer an accessory app so toasts never
+# steal focus. Optional — the client degrades gracefully without it.
+pyobjc-framework-Cocoa>=9.0; sys_platform == "darwin"
