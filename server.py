@@ -50,11 +50,10 @@ LOCK_DEFAULT_WAIT_MS = 60000
 LOCK_WATCHDOG_INTERVAL_S = 0.25
 NOTIFY_ON_LOCK = os.environ.get("NOTIFY_ON_LOCK", "1").lower() not in ("0", "false", "no")
 
-# Where the persistent "screen locked" toast goes — the client whose screen the
-# automation actually drives (and where you watch it), i.e. the machine running
-# the lock holder. Set to "*" to pin it on every connected client instead.
-LOCK_NOTIFY_TARGET = os.environ.get("NOTIFY_LOCK_TARGET", "mainbook")
-# Stable id so acquire pins one toast and release clears that exact toast; reusing
+# Where the "screen locked" toast goes — the mac mini, whose screen the lock
+# guards. Set to "*" to pin it on every connected client instead.
+LOCK_NOTIFY_TARGET = os.environ.get("NOTIFY_LOCK_TARGET", "macmini")
+# Stable id so acquire shows one toast and release clears that exact toast; reusing
 # the id also lets a hand-off replace the holder text in place.
 LOCK_NOTIFY_ID = "screen-lock"
 
@@ -184,21 +183,36 @@ def _route_lock_notification(msg: dict) -> None:
         asyncio.create_task(hub.deliver(LOCK_NOTIFY_TARGET, msg))
 
 
-def _lock_notify_held(client: str) -> None:
-    """Pin a persistent 'screen locked' toast (replaces the prior holder's)."""
-    _route_lock_notification({
+def _lock_held_msg(client: str, duration_ms: float) -> dict:
+    """A 'screen locked' toast that **auto-expires with the lease**.
+
+    Deliberately NOT `persistent`: a truly persistent toast outlives any lost
+    `clear` (server restart, or the target offline at release) and strands a 🔒
+    on screen forever — which looks like the lock is stuck. Tying its lifetime to
+    the lease TTL bounds that: the toast can never outlive the lock by more than
+    one TTL, and while the lock is genuinely held it's refreshed on every renew
+    (reusing the id resets the client-side timer), so it stays up the whole time.
+    """
+    return {
         "type": "notify",
         "id": LOCK_NOTIFY_ID,
         "title": "🔒 Screen locked",
         "message": f"{client} is controlling the screen",
-        "duration_ms": None,
-        "persistent": True,
-    })
+        "duration_ms": max(1, int(duration_ms)),
+        "persistent": False,
+    }
+
+
+def _lock_clear_msg() -> dict:
+    return {"type": "clear", "id": LOCK_NOTIFY_ID, "all": False}
+
+
+def _lock_notify_held(client: str, ttl_ms: float) -> None:
+    _route_lock_notification(_lock_held_msg(client, ttl_ms))
 
 
 def _lock_notify_free() -> None:
-    """Clear the persistent lock toast when the screen is no longer held."""
-    _route_lock_notification({"type": "clear", "id": LOCK_NOTIFY_ID, "all": False})
+    _route_lock_notification(_lock_clear_msg())
 
 
 @dataclass
@@ -230,7 +244,7 @@ class ScreenLock:
         now = time.time()
         lease = Lease(client, uuid.uuid4().hex, now, now + ttl_ms / 1000.0)
         self._holder = lease
-        _lock_notify_held(client)
+        _lock_notify_held(client, ttl_ms)
         return lease
 
     def _reap_locked(self) -> None:
@@ -242,8 +256,8 @@ class ScreenLock:
     def _promote_locked(self) -> None:
         """Give the lock to the next live waiter, or leave it free.
 
-        Notifications follow the holder: a grant repins the persistent toast for
-        the new holder (`_grant_locked`); draining to no holder clears it.
+        Notifications follow the holder: a grant repins the lock toast for the new
+        holder (`_grant_locked`); draining to no holder clears it.
         """
         while self._waiters:
             client, ttl_ms, fut = self._waiters.popleft()
@@ -290,6 +304,7 @@ class ScreenLock:
             if self._holder is None or self._holder.token != token:
                 return None
             self._holder.expires_at = time.time() + ttl_ms / 1000.0
+            _lock_notify_held(self._holder.client, ttl_ms)  # refresh the toast timer
             return self._holder
 
     async def status(self) -> dict:
@@ -313,6 +328,26 @@ class ScreenLock:
 
 
 lock = ScreenLock()
+
+
+async def _reconcile_lock_toast(client: str, ws: WebSocket) -> None:
+    """Bring a just-(re)connected client's lock toast in line with reality.
+
+    Belt-and-suspenders against orphans: if a live lock targets this client,
+    re-assert the toast with the lease's remaining time; otherwise clear any
+    stale 🔒 it may still be showing from before it dropped or the server
+    restarted. Clearing a non-existent toast is a harmless no-op, so this is
+    always safe to send.
+    """
+    if not NOTIFY_ON_LOCK:
+        return
+    st = await lock.status()
+    is_target = LOCK_NOTIFY_TARGET in (BROADCAST, client)
+    if st["locked"] and is_target:
+        remaining_ms = (st["expires_at"] - time.time()) * 1000.0
+        await Hub._safe_send(ws, _lock_held_msg(st["holder"], remaining_ms))
+    else:
+        await Hub._safe_send(ws, _lock_clear_msg())
 
 
 def check_auth(x_auth_token: Optional[str] = Header(default=None)) -> None:
@@ -341,6 +376,7 @@ async def ws_endpoint(ws: WebSocket):
         return
     await ws.accept()
     await hub.register(client, ws)
+    await _reconcile_lock_toast(client, ws)
     try:
         while True:
             await ws.receive_text()  # inbound is ignored; keeps the socket open

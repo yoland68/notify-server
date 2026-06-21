@@ -75,12 +75,15 @@ Runs entirely on uvicorn's asyncio loop (no threads, no Tkinter). Started with `
   `asyncio.Lock`. `watchdog()` (started via `lifespan`) expires abandoned leases and promotes the
   next waiter, preventing deadlock if a holder crashes. Acquire/release/promote are race-safe (a
   timed-out waiter is skipped on promotion). Notifications track holder state via two helpers:
-  `_grant_locked` calls `_lock_notify_held` (a **persistent** toast, stable id `screen-lock`) and
-  the drain tail of `_promote_locked` calls `_lock_notify_free` (clear). So holding the lock pins a
-  "🔒 Screen locked" toast on `NOTIFY_LOCK_TARGET` (default `mainbook`, `*` for all), repins it on
-  hand-off, and clears it on release/expiry, when `NOTIFY_ON_LOCK` is on. The lock is **advisory**
-  and **global** (one shared screen abstraction across all clients) — the backend never surfaces
-  windows or clicks.
+  `_grant_locked`/`renew` call `_lock_notify_held` and the drain tail of `_promote_locked` calls
+  `_lock_notify_free` (clear). So holding the lock shows a "🔒 Screen locked" toast (stable id
+  `screen-lock`) on `NOTIFY_LOCK_TARGET` (default `macmini`, `*` for all), repins it on hand-off,
+  and clears it on release/expiry, when `NOTIFY_ON_LOCK` is on. The toast is **not** `persistent`:
+  it carries `duration_ms == lease TTL` and is refreshed on `renew`, so it auto-expires with the
+  lease and a lost `clear` can't strand it forever. `_reconcile_lock_toast` (called from
+  `ws_endpoint` after `hub.register`) re-asserts or clears the toast on every (re)connect to wipe
+  orphans. The lock is **advisory** and **global** (one shared screen abstraction across all
+  clients) — the backend never surfaces windows or clicks.
 - `check_auth` — dependency enforcing `X-Auth-Token` on `/notify`, `/notify/clear`, `/clients`,
   and all `/lock/*` (not `/health`). WS auth uses `?token=`.
 - Lock endpoints: `POST /lock/acquire` (blocks, FIFO, `408` on `wait_timeout_ms`; returns a
@@ -101,7 +104,7 @@ those queues every 100ms.
 ### Environment variables
 
 Backend: `NOTIFY_HOST` (`0.0.0.0`), `NOTIFY_PORT` (`8766`), `NOTIFY_TOKEN` (auth; `X-Auth-Token`
-header for HTTP and `?token=` for WS), `NOTIFY_ON_LOCK` (`1`; persistent lock toasts), `NOTIFY_LOCK_TARGET` (`mainbook`; lock-toast recipient, `*` = all),
+header for HTTP and `?token=` for WS), `NOTIFY_ON_LOCK` (`1`; lock toasts), `NOTIFY_LOCK_TARGET` (`macmini`; lock-toast recipient, `*` = all),
 `NOTIFY_QUEUE_TTL_S` (`3600`), `NOTIFY_QUEUE_MAX` (`100`).
 
 Client: `NOTIFY_BACKEND` (`ws://localhost:8766`), `NOTIFY_CLIENT` (default: hostname),

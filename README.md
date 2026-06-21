@@ -60,8 +60,8 @@ The backend host can also run its own client (the two are separate processes).
 | `NOTIFY_HOST` | `0.0.0.0` | Bind address |
 | `NOTIFY_PORT` | `8766` | Listen port |
 | `NOTIFY_TOKEN` | _(unset)_ | If set, HTTP requests need `X-Auth-Token: <value>` and WS connects need `?token=<value>` |
-| `NOTIFY_ON_LOCK` | `1` | Pin a persistent "🔒 Screen locked" toast while the screen lock is held, cleared on release/expiry. `0` to disable. |
-| `NOTIFY_LOCK_TARGET` | `mainbook` | Client that receives the persistent lock toast — the machine whose screen the automation drives. `*` to pin it on every connected client. |
+| `NOTIFY_ON_LOCK` | `1` | Show a "🔒 Screen locked" toast while the screen lock is held, cleared on release/expiry. `0` to disable. |
+| `NOTIFY_LOCK_TARGET` | `macmini` | Client that shows the lock toast — the mac mini whose screen the lock guards. `*` to pin it on every connected client. |
 | `NOTIFY_QUEUE_TTL_S` | `3600` | How long an offline client's queued messages live |
 | `NOTIFY_QUEUE_MAX` | `100` | Max queued messages per offline client (oldest dropped) |
 
@@ -163,11 +163,16 @@ others **block** on `acquire` (long-poll) and are granted the lock in **FIFO ord
 frees up. Every grant returns a fencing `token` required to `release` or `renew` — so a stale
 holder (whose lease already expired and was handed to someone else) can never release or extend
 someone else's lock. A watchdog auto-expires abandoned leases, so a crashed holder can't
-deadlock everyone. When `NOTIFY_ON_LOCK` is on, holding the lock pins a **persistent** "🔒 Screen
-locked" toast on `NOTIFY_LOCK_TARGET` (default `mainbook` — the client whose screen the automation
-drives) for as long as it's held; the toast (stable id `screen-lock`) is repinned for the new
-holder on hand-off and cleared on release or lease expiry, so that machine always shows whether
-its screen is currently under automation.
+deadlock everyone. When `NOTIFY_ON_LOCK` is on, holding the lock shows a "🔒 Screen locked" toast
+on `NOTIFY_LOCK_TARGET` (default `macmini`) for as long as it's held; the toast (stable id
+`screen-lock`) is repinned for the new holder on hand-off and cleared on release or lease expiry.
+
+The toast is deliberately **not** a `persistent` one. It carries `duration_ms` equal to the lease
+TTL and is refreshed on every `renew`, so it stays visible while the lock is genuinely held but
+**auto-expires with the lease** — a lost `clear` (server restart, or the target offline at the
+moment of release) can never strand a 🔒 on screen forever. As a second guard, a client is
+reconciled on every (re)connect: it's re-shown the toast if a lock it targets is live, or sent a
+`clear` otherwise, so any orphaned toast is wiped the moment that client reconnects.
 
 > Note: this is a single *global* lock across all clients (one shared "screen" abstraction),
 > not one lock per machine. Revisit if you need per-client locks.
