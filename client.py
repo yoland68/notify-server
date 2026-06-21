@@ -59,6 +59,16 @@ class ToastManager:
             self._destroy(self.by_id[toast_id])
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
+        # macOS: render as a non-activating floating panel so the toast layers
+        # on top WITHOUT stealing focus or making this app the active one (same
+        # window class IDLE uses for tooltips). Without this, creating the window
+        # activates the Python app and takes over the foreground UI.
+        try:
+            if win.tk.call("tk", "windowingsystem") == "aqua":
+                win.tk.call("::tk::unsupported::MacWindowStyle",
+                            "style", win._w, "help", "noActivates")
+        except tk.TclError:
+            pass
         win.attributes("-topmost", True)
         try:
             win.attributes("-alpha", 0.96)
